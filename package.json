@@ -1,0 +1,35 @@
+{
+  "name": "billin-mcp-server",
+  "version": "1.0.0",
+  "description": "MCP server for Billin — invoicing, expenses, and tax compliance for Spanish freelancers and SMBs",
+  "type": "module",
+  "bin": {
+    "billin-mcp-server": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsc --watch"
+  },
+  "keywords": [
+    "mcp",
+    "billin",
+    "invoicing",
+    "facturacion",
+    "verifactu",
+    "tax",
+    "spain",
+    "autonomos",
+    "model-context-protocol"
+  ],
+  "author": "Alexander Rahe",
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.25.2",
+    "zod": "^4.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.8.0"
+  }
+}
