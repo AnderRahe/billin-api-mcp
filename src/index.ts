@@ -176,12 +176,23 @@ const addressSchema = z
       .describe(
         "ISO 3166-2:ES province code (required for Spain). Examples: ES-M (Madrid), ES-B (Barcelona), ES-V (Valencia), ES-SE (Sevilla), ES-BI (Vizcaya)"
       ),
-    city: z.string().optional().describe("City"),
-    postalAddress: z.string().optional().describe("Street address"),
-    postalCode: z.string().optional().describe("Postal code"),
+    city: z
+      .string()
+      .optional()
+      .describe("City (required for Spanish contacts)"),
+    postalAddress: z
+      .string()
+      .optional()
+      .describe("Street address (max 64 chars)"),
+    postalCode: z
+      .string()
+      .optional()
+      .describe("Postal code (required for Spanish contacts, max 20 chars)"),
   })
   .optional()
-  .describe("Address — province is required for Spanish contacts");
+  .describe(
+    "Address — province, city, and postalCode are required for Spanish contacts"
+  );
 
 const lineItemSchema = z.object({
   name: z.string().describe("Item description"),
@@ -370,7 +381,7 @@ server.registerTool(
       ...params,
       lines: params.lines.map(computeLine),
     };
-    const result = await billinFetch("/receipts", {
+    const result = await billinFetch("/invoices/sales-receipts", {
       method: "POST",
       body: JSON.stringify(body),
     });
@@ -451,11 +462,19 @@ server.registerTool(
   {
     title: "Create Expense",
     description:
-      "Record a business expense with tax classification. Provide subtotal and tax key — tax amount is auto-calculated.",
+      "Record a business expense with tax classification. Provide subtotal and tax key — tax amount is auto-calculated. Requires serialCode (e.g. 'GASTO') for numbering series.",
     inputSchema: {
       identifier: z
         .string()
         .describe("Supplier invoice number / expense identifier"),
+      serialCode: z
+        .string()
+        .optional()
+        .describe("Serial code for expense numbering series (e.g. 'GASTO'). Either serialCode or serieId is required."),
+      serieId: z
+        .string()
+        .optional()
+        .describe("Serie UUID. Takes priority over serialCode if both provided."),
       issuedDate: z.string().describe("Issue date YYYY-MM-DD"),
       currency: z.string().default("EUR").describe("Currency (default: EUR)"),
       lines: z
@@ -536,11 +555,27 @@ server.registerTool(
   {
     title: "Create Quote",
     description:
-      "Create a quote (presupuesto) that can be sent to clients and later converted into an invoice. Tax amounts are auto-calculated.",
+      "Create a quote (presupuesto) that can be sent to clients and later converted into an invoice. Tax amounts are auto-calculated. Requires either serieId or serialCode to assign a numbering series.",
     inputSchema: {
       currency: z.string().default("EUR").describe("Currency (default: EUR)"),
+      serialCode: z
+        .string()
+        .optional()
+        .describe(
+          "Serial code for quote numbering series (e.g. 'PRES'). Either serialCode or serieId is required."
+        ),
+      serieId: z
+        .string()
+        .optional()
+        .describe(
+          "Serie UUID. Takes priority over serialCode if both provided."
+        ),
       issuedDate: z.string().optional().describe("Quote date YYYY-MM-DD"),
-      validUntil: z.string().optional().describe("Expiration date YYYY-MM-DD"),
+      dueDate: z.string().optional().describe("Expiration / due date YYYY-MM-DD"),
+      status: z
+        .enum(["PENDING", "ACCEPTED", "REJECTED"])
+        .optional()
+        .describe("Quote status (default: PENDING)"),
       lines: z.array(lineItemSchema).describe("Line items"),
       contact: z
         .object({
@@ -555,8 +590,9 @@ server.registerTool(
     },
   },
   async (params) => {
+    const { ...rest } = params;
     const body = {
-      ...params,
+      ...rest,
       lines: params.lines.map(computeLine),
     };
     const result = await billinFetch("/quotes", {
@@ -573,19 +609,51 @@ server.registerTool(
   {
     title: "Create Payment",
     description:
-      "Record a payment for an invoice to track collection status.",
+      "Record a payment (income or expense). Link it to a document via documentsIds or to a contact via contactId (mutually exclusive — provide one or neither).",
     inputSchema: {
-      invoiceId: z.string().describe("Invoice ID (UUID) being paid"),
-      amount: z.number().describe("Payment amount"),
-      currency: z.string().default("EUR").describe("Currency (default: EUR)"),
-      paymentDate: z
+      operationDate: z
+        .string()
+        .describe("Payment date in YYYY-MM-DD format (required)"),
+      amount: z.number().describe("Payment amount (minimum 0.01)"),
+      type: z
+        .enum(["INCOME", "EXPENSE"])
+        .describe(
+          "INCOME = payment received, EXPENSE = payment made"
+        ),
+      method: z
+        .enum([
+          "CREDIT_CARD",
+          "BIZUM",
+          "CASH",
+          "DIRECT_DEBIT",
+          "PROMISSORY_NOTE",
+          "TRANSFER",
+          "OTHER",
+          "CONFIRMING",
+          "NOT_CONFIRMED",
+        ])
+        .optional()
+        .describe("Payment method"),
+      documentsIds: z
+        .array(z.string())
+        .optional()
+        .describe(
+          "Array with a single document/invoice UUID to link this payment to. Mutually exclusive with contactId."
+        ),
+      contactId: z
         .string()
         .optional()
-        .describe("Payment date YYYY-MM-DD (defaults to today)"),
-      paymentMethod: z
+        .describe(
+          "Contact UUID to link this payment to. Mutually exclusive with documentsIds."
+        ),
+      accountingAccountId: z
         .string()
         .optional()
-        .describe("Payment method (e.g. transfer, cash, card)"),
+        .describe("Related accounting account UUID"),
+      description: z
+        .string()
+        .optional()
+        .describe("Payment description (max 250 chars)"),
     },
   },
   async (params) => {
