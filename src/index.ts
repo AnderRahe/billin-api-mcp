@@ -24,15 +24,61 @@ if (!parsedUrl.hostname.endsWith("billin.net")) {
   process.exit(1);
 }
 
+// --- Tax Rate Lookup ---
+
+const TAX_RATES: Record<string, number> = {
+  IVA_21: 0.21,
+  IVA_10: 0.10,
+  IVA_4: 0.04,
+  IVA_0: 0,
+};
+
+const SALES_EQ_RATES: Record<string, number> = {
+  RE_52: 0.052,
+  RE_14: 0.014,
+  RE_01: 0.005,
+};
+
+function computeLine(line: {
+  name: string;
+  quantity: number;
+  unitPrice: number;
+  taxKey: string;
+  discountPercentage?: number;
+}) {
+  const subtotal = +(line.quantity * line.unitPrice).toFixed(2);
+  const discountPercentage = line.discountPercentage ?? 0;
+  const discountAmount = +(subtotal * discountPercentage / 100).toFixed(2);
+  const taxBase = subtotal - discountAmount;
+  const taxRate = TAX_RATES[line.taxKey] ?? 0;
+  const taxAmount = +(taxBase * taxRate).toFixed(2);
+  const salesEqRate = SALES_EQ_RATES[line.taxKey] ?? 0;
+  const salesEqTaxAmount = +(taxBase * salesEqRate).toFixed(2);
+  const totalAmount = +(taxBase + taxAmount + salesEqTaxAmount).toFixed(2);
+
+  return {
+    name: line.name,
+    quantity: line.quantity,
+    unitPrice: line.unitPrice,
+    taxKey: line.taxKey,
+    discountPercentage,
+    discountAmount,
+    taxAmount,
+    salesEqTaxAmount,
+    totalAmount,
+  };
+}
+
 // --- OAuth2 JWT Auth ---
 
 let accessToken: string | null = null;
 
 async function authenticate(): Promise<string> {
-  const response = await fetch(`${API_URL}/authcontroller_gettoken_v1`, {
+  const response = await fetch(`${API_URL}/auth/token`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
+      grantType: "client_credentials",
       clientId: CLIENT_ID,
       clientSecret: CLIENT_SECRET,
     }),
@@ -43,16 +89,19 @@ async function authenticate(): Promise<string> {
     throw new Error(`Authentication failed (${response.status}): ${text}`);
   }
 
-  const data = (await response.json()) as { token?: string; accessToken?: string };
-  const token = data.token || data.accessToken;
-  if (!token) {
+  const data = (await response.json()) as {
+    accessToken?: string;
+    refreshToken?: string;
+    expireIn?: number;
+  };
+  if (!data.accessToken) {
     throw new Error(
       `Authentication response missing token: ${JSON.stringify(data)}`
     );
   }
 
-  accessToken = token;
-  return token;
+  accessToken = data.accessToken;
+  return accessToken;
 }
 
 // --- API Fetch Wrapper ---
@@ -116,6 +165,40 @@ function formatResult(result: { ok: boolean; status: number; data: unknown }) {
   };
 }
 
+// --- Shared Zod Schemas ---
+
+const addressSchema = z
+  .object({
+    country: z.string().default("ES").describe("ISO country code (default: ES)"),
+    province: z
+      .string()
+      .optional()
+      .describe(
+        "ISO 3166-2:ES province code (required for Spain). Examples: ES-M (Madrid), ES-B (Barcelona), ES-V (Valencia), ES-SE (Sevilla), ES-BI (Vizcaya)"
+      ),
+    city: z.string().optional().describe("City"),
+    postalAddress: z.string().optional().describe("Street address"),
+    postalCode: z.string().optional().describe("Postal code"),
+  })
+  .optional()
+  .describe("Address — province is required for Spanish contacts");
+
+const lineItemSchema = z.object({
+  name: z.string().describe("Item description"),
+  quantity: z.number().default(1).describe("Quantity"),
+  unitPrice: z.number().describe("Unit price before tax"),
+  taxKey: z
+    .string()
+    .default("IVA_21")
+    .describe(
+      "Tax code: IVA_21 (21%), IVA_10 (10%), IVA_4 (4%), IVA_0 (0%). Tax amounts are auto-calculated"
+    ),
+  discountPercentage: z
+    .number()
+    .optional()
+    .describe("Discount percentage (0-100)"),
+});
+
 // --- Server ---
 
 const server = new McpServer({
@@ -129,12 +212,8 @@ server.registerTool(
   {
     title: "Create Invoice",
     description:
-      "Create a tax-compliant invoice in Billin. Supports Spanish tax codes (IVA_21, IVA_10, IVA_4, etc.) and Verifactu compliance. Provide line items with tax classification and a contact (existing or inline).",
+      "Create a tax-compliant invoice in Billin with automatic tax calculation. Supports Spanish tax codes (IVA 21%, 10%, 4%, 0%) and Verifactu compliance. Just provide item name, quantity, unit price, and tax code — amounts are computed automatically.",
     inputSchema: {
-      serialCode: z
-        .string()
-        .optional()
-        .describe("Custom serial code for the invoice (e.g. F2026001). Auto-generated if omitted"),
       currency: z
         .string()
         .default("EUR")
@@ -142,24 +221,12 @@ server.registerTool(
       issuedDate: z
         .string()
         .optional()
-        .describe("Invoice issue date in ISO 8601 format (e.g. 2026-04-06). Defaults to today"),
+        .describe("Issue date YYYY-MM-DD (defaults to today)"),
       dueDate: z
         .string()
         .optional()
-        .describe("Payment due date in ISO 8601 format"),
-      lines: z
-        .array(
-          z.object({
-            name: z.string().describe("Item description"),
-            quantity: z.number().default(1).describe("Quantity"),
-            unitPrice: z.number().describe("Unit price before tax"),
-            taxKey: z
-              .string()
-              .default("IVA_21")
-              .describe("Tax code: IVA_21, IVA_10, IVA_4, IVA_0, IRPF_15, IRPF_7, RE_52, RE_14, RE_01"),
-          })
-        )
-        .describe("Line items for the invoice"),
+        .describe("Payment due date YYYY-MM-DD"),
+      lines: z.array(lineItemSchema).describe("Invoice line items"),
       contact: z
         .object({
           fiscalName: z.string().describe("Legal/fiscal name of the client"),
@@ -168,29 +235,21 @@ server.registerTool(
             .optional()
             .describe("Tax ID / NIF / CIF / VAT number"),
           email: z.string().optional().describe("Contact email"),
-          address: z
-            .object({
-              country: z.string().default("ES").describe("ISO country code"),
-              province: z
-                .string()
-                .optional()
-                .describe("Province (required for Spain)"),
-              city: z.string().optional().describe("City"),
-              street: z.string().optional().describe("Street address"),
-              postalCode: z.string().optional().describe("Postal code"),
-            })
-            .optional()
-            .describe("Contact address"),
+          address: addressSchema,
         })
-        .describe("Invoice recipient — provide fiscal name at minimum"),
+        .describe("Invoice recipient"),
       reference: z.string().optional().describe("Internal reference or PO number"),
       comments: z.string().optional().describe("Notes to appear on the invoice"),
     },
   },
   async (params) => {
+    const body = {
+      ...params,
+      lines: params.lines.map(computeLine),
+    };
     const result = await billinFetch("/invoices", {
       method: "POST",
-      body: JSON.stringify(params),
+      body: JSON.stringify(body),
     });
     return formatResult(result);
   }
@@ -202,7 +261,7 @@ server.registerTool(
   {
     title: "List Invoices",
     description:
-      "List and filter invoices from your Billin account. Filter by document type, status, payment status, date range, VAT number, or Verifactu invoices.",
+      "List and filter invoices. Filter by status, payment status, date range, VAT number, or Verifactu compliance.",
     inputSchema: {
       documentType: z
         .enum(["INVOICE", "CORRECTIVE", "TEST_INVOICE"])
@@ -212,18 +271,15 @@ server.registerTool(
         .enum(["DRAFT", "ISSUED", "VOID", "CORRECTED", "REPLACED"])
         .optional()
         .describe("Filter by invoice status"),
-      isPaid: z
-        .boolean()
-        .optional()
-        .describe("Filter by payment status"),
+      isPaid: z.boolean().optional().describe("Filter by payment status"),
       issuedDateFrom: z
         .string()
         .optional()
-        .describe("Filter invoices issued on or after this date (YYYY-MM-DD)"),
+        .describe("Invoices issued on or after this date (YYYY-MM-DD)"),
       issuedDateTo: z
         .string()
         .optional()
-        .describe("Filter invoices issued on or before this date (YYYY-MM-DD)"),
+        .describe("Invoices issued on or before this date (YYYY-MM-DD)"),
       vatNumber: z
         .string()
         .optional()
@@ -235,31 +291,29 @@ server.registerTool(
       sortBy: z
         .enum(["issuedDate", "createdAt", "updatedAt", "serialCode", "code"])
         .optional()
-        .describe("Field to sort by"),
-      sortOrder: z
-        .enum(["ASC", "DESC"])
-        .optional()
-        .describe("Sort direction"),
-      limit: z
-        .number()
-        .optional()
-        .describe("Max results to return (1-100, default 10)"),
-      offset: z
-        .number()
-        .optional()
-        .describe("Number of results to skip for pagination"),
+        .describe("Sort field"),
+      sortOrder: z.enum(["ASC", "DESC"]).optional().describe("Sort direction"),
+      limit: z.number().optional().describe("Max results (1-100, default 10)"),
+      offset: z.number().optional().describe("Skip N results for pagination"),
     },
   },
   async (params) => {
     const query = new URLSearchParams();
-    if (params.documentType) query.set("query[documentType]", params.documentType);
+    if (params.documentType)
+      query.set("query[documentType]", params.documentType);
     if (params.status) query.set("query[status]", params.status);
-    if (params.isPaid !== undefined) query.set("query[isPaid]", String(params.isPaid));
-    if (params.issuedDateFrom) query.set("query[issuedDate][$gte]", params.issuedDateFrom);
-    if (params.issuedDateTo) query.set("query[issuedDate][$lte]", params.issuedDateTo);
-    if (params.vatNumber) query.set("query[contact][vatNumber]", params.vatNumber);
-    if (params.verifactuOnly) query.set("query[getVerifactuInvoices]", "true");
-    if (params.sortBy) query.set(`sort[${params.sortBy}]`, params.sortOrder || "DESC");
+    if (params.isPaid !== undefined)
+      query.set("query[isPaid]", String(params.isPaid));
+    if (params.issuedDateFrom)
+      query.set("query[issuedDate][$gte]", params.issuedDateFrom);
+    if (params.issuedDateTo)
+      query.set("query[issuedDate][$lte]", params.issuedDateTo);
+    if (params.vatNumber)
+      query.set("query[contact][vatNumber]", params.vatNumber);
+    if (params.verifactuOnly)
+      query.set("query[getVerifactuInvoices]", "true");
+    if (params.sortBy)
+      query.set(`sort[${params.sortBy}]`, params.sortOrder || "DESC");
     if (params.limit !== undefined) query.set("limit", String(params.limit));
     if (params.offset !== undefined) query.set("offset", String(params.offset));
 
@@ -276,13 +330,15 @@ server.registerTool(
   {
     title: "Get Invoice",
     description:
-      "Get the full details of a specific invoice by its ID. Returns line items, tax breakdown, contact info, payment status, and Verifactu data.",
+      "Get full details of a specific invoice by ID. Returns line items, tax breakdown, contact, payment status, and Verifactu data.",
     inputSchema: {
-      id: z.string().describe("Invoice ID"),
+      id: z.string().describe("Invoice ID (UUID)"),
     },
   },
   async (params) => {
-    const result = await billinFetch(`/invoices/${encodeURIComponent(params.id)}`);
+    const result = await billinFetch(
+      `/invoices/${encodeURIComponent(params.id)}`
+    );
     return formatResult(result);
   }
 );
@@ -293,30 +349,16 @@ server.registerTool(
   {
     title: "Create Receipt",
     description:
-      "Create a simplified sales receipt (ticket) in Billin. Used for point-of-sale transactions where a full invoice is not required.",
+      "Create a simplified sales receipt (ticket) for point-of-sale transactions. Tax amounts are auto-calculated.",
     inputSchema: {
-      currency: z.string().default("EUR").describe("Currency code (default: EUR)"),
-      issuedDate: z
-        .string()
-        .optional()
-        .describe("Issue date in ISO 8601 format"),
-      lines: z
-        .array(
-          z.object({
-            name: z.string().describe("Item description"),
-            quantity: z.number().default(1).describe("Quantity"),
-            unitPrice: z.number().describe("Unit price before tax"),
-            taxKey: z
-              .string()
-              .default("IVA_21")
-              .describe("Tax code (e.g. IVA_21, IVA_10, IVA_4)"),
-          })
-        )
-        .describe("Line items"),
+      currency: z.string().default("EUR").describe("Currency (default: EUR)"),
+      issuedDate: z.string().optional().describe("Issue date YYYY-MM-DD"),
+      lines: z.array(lineItemSchema).describe("Line items"),
       contact: z
         .object({
           fiscalName: z.string().describe("Client name"),
           vatNumber: z.string().optional().describe("Tax ID / NIF"),
+          address: addressSchema,
         })
         .optional()
         .describe("Optional contact info"),
@@ -324,9 +366,13 @@ server.registerTool(
     },
   },
   async (params) => {
+    const body = {
+      ...params,
+      lines: params.lines.map(computeLine),
+    };
     const result = await billinFetch("/receipts", {
       method: "POST",
-      body: JSON.stringify(params),
+      body: JSON.stringify(body),
     });
     return formatResult(result);
   }
@@ -338,30 +384,18 @@ server.registerTool(
   {
     title: "Create Contact",
     description:
-      "Create a new contact (customer or supplier) in Billin. Contacts can be referenced when creating invoices, expenses, or quotes.",
+      "Create a customer or supplier contact in Billin. Contacts can be referenced when creating invoices, expenses, or quotes.",
     inputSchema: {
       fiscalName: z.string().describe("Legal/fiscal name"),
-      vatNumber: z.string().optional().describe("Tax ID / NIF / CIF / VAT number"),
+      vatNumber: z
+        .string()
+        .optional()
+        .describe("Tax ID / NIF / CIF / VAT number"),
       email: z.string().optional().describe("Email address"),
       phone: z.string().optional().describe("Phone number"),
-      isCustomer: z
-        .boolean()
-        .optional()
-        .describe("Mark as customer (default: true)"),
-      isProvider: z
-        .boolean()
-        .optional()
-        .describe("Mark as supplier/provider"),
-      address: z
-        .object({
-          country: z.string().default("ES").describe("ISO country code"),
-          province: z.string().optional().describe("Province (required for Spain)"),
-          city: z.string().optional().describe("City"),
-          street: z.string().optional().describe("Street address"),
-          postalCode: z.string().optional().describe("Postal code"),
-        })
-        .optional()
-        .describe("Contact address"),
+      isCustomer: z.boolean().optional().describe("Mark as customer (default: true)"),
+      isProvider: z.boolean().optional().describe("Mark as supplier"),
+      address: addressSchema,
     },
   },
   async (params) => {
@@ -378,27 +412,29 @@ server.registerTool(
   "list_contacts",
   {
     title: "List Contacts",
-    description:
-      "List and search contacts in your Billin account. Filter by VAT number, customer/supplier type.",
+    description: "List and search contacts. Filter by VAT number or type.",
     inputSchema: {
-      vatNumber: z.string().optional().describe("Filter by exact VAT/NIF number"),
-      isCustomer: z.boolean().optional().describe("Filter by customer flag"),
-      isProvider: z.boolean().optional().describe("Filter by supplier flag"),
+      vatNumber: z.string().optional().describe("Filter by exact VAT/NIF"),
+      isCustomer: z.boolean().optional().describe("Filter customers only"),
+      isProvider: z.boolean().optional().describe("Filter suppliers only"),
       sortBy: z
         .enum(["fiscalName", "vatNumber", "updatedAt", "createdAt"])
         .optional()
-        .describe("Field to sort by"),
+        .describe("Sort field"),
       sortOrder: z.enum(["ASC", "DESC"]).optional().describe("Sort direction"),
       limit: z.number().optional().describe("Max results (1-100, default 10)"),
-      offset: z.number().optional().describe("Results to skip for pagination"),
+      offset: z.number().optional().describe("Skip N results"),
     },
   },
   async (params) => {
     const query = new URLSearchParams();
     if (params.vatNumber) query.set("query[vatNumber]", params.vatNumber);
-    if (params.isCustomer !== undefined) query.set("query[isCustomer]", String(params.isCustomer));
-    if (params.isProvider !== undefined) query.set("query[isProvider]", String(params.isProvider));
-    if (params.sortBy) query.set(`sort[${params.sortBy}]`, params.sortOrder || "ASC");
+    if (params.isCustomer !== undefined)
+      query.set("query[isCustomer]", String(params.isCustomer));
+    if (params.isProvider !== undefined)
+      query.set("query[isProvider]", String(params.isProvider));
+    if (params.sortBy)
+      query.set(`sort[${params.sortBy}]`, params.sortOrder || "ASC");
     if (params.limit !== undefined) query.set("limit", String(params.limit));
     if (params.offset !== undefined) query.set("offset", String(params.offset));
 
@@ -415,45 +451,57 @@ server.registerTool(
   {
     title: "Create Expense",
     description:
-      "Record a business expense in Billin. Used for tracking purchases, supplier invoices, and deductible costs with proper tax classification.",
+      "Record a business expense with tax classification. Provide subtotal and tax key — tax amount is auto-calculated.",
     inputSchema: {
-      identifier: z.string().describe("Expense identifier (supplier invoice number)"),
-      issuedDate: z.string().describe("Issue date in ISO 8601 format (YYYY-MM-DD)"),
-      currency: z.string().default("EUR").describe("Currency code (default: EUR)"),
+      identifier: z
+        .string()
+        .describe("Supplier invoice number / expense identifier"),
+      issuedDate: z.string().describe("Issue date YYYY-MM-DD"),
+      currency: z.string().default("EUR").describe("Currency (default: EUR)"),
       lines: z
         .array(
           z.object({
             name: z.string().describe("Expense description"),
             subtotal: z.number().describe("Amount before tax"),
-            totalAmount: z.number().describe("Amount including tax"),
             taxKey: z
               .string()
               .default("IVA_21")
-              .describe("Tax code (e.g. IVA_21, IVA_10, IVA_4)"),
-            taxAmount: z.number().describe("Tax amount"),
+              .describe("Tax code (IVA_21, IVA_10, IVA_4, IVA_0)"),
           })
         )
-        .describe("Expense line items"),
+        .describe("Expense line items — taxAmount and totalAmount are auto-calculated"),
       contact: z
         .object({
           fiscalName: z.string().describe("Supplier fiscal name"),
-          vatNumber: z.string().optional().describe("Supplier tax ID / NIF / CIF"),
-          address: z
-            .object({
-              country: z.string().default("ES").describe("ISO country code"),
-              province: z.string().optional().describe("Province"),
-            })
+          vatNumber: z
+            .string()
             .optional()
-            .describe("Supplier address"),
+            .describe("Supplier tax ID / NIF / CIF"),
+          address: addressSchema,
         })
         .describe("Supplier contact"),
       comments: z.string().optional().describe("Notes"),
     },
   },
   async (params) => {
+    const body = {
+      ...params,
+      lines: params.lines.map((line) => {
+        const taxRate = TAX_RATES[line.taxKey] ?? 0;
+        const taxAmount = +(line.subtotal * taxRate).toFixed(2);
+        const totalAmount = +(line.subtotal + taxAmount).toFixed(2);
+        return {
+          name: line.name,
+          subtotal: line.subtotal,
+          taxKey: line.taxKey,
+          taxAmount,
+          totalAmount,
+        };
+      }),
+    };
     const result = await billinFetch("/expenses", {
       method: "POST",
-      body: JSON.stringify(params),
+      body: JSON.stringify(body),
     });
     return formatResult(result);
   }
@@ -464,11 +512,10 @@ server.registerTool(
   "list_expenses",
   {
     title: "List Expenses",
-    description:
-      "List expenses from your Billin account. Useful for reviewing business costs and tax-deductible purchases.",
+    description: "List recorded expenses for reviewing costs and deductions.",
     inputSchema: {
       limit: z.number().optional().describe("Max results (1-100, default 10)"),
-      offset: z.number().optional().describe("Results to skip for pagination"),
+      offset: z.number().optional().describe("Skip N results"),
     },
   },
   async (params) => {
@@ -489,45 +536,18 @@ server.registerTool(
   {
     title: "Create Quote",
     description:
-      "Create a quote (presupuesto) in Billin. Quotes can be sent to clients and later converted into invoices.",
+      "Create a quote (presupuesto) that can be sent to clients and later converted into an invoice. Tax amounts are auto-calculated.",
     inputSchema: {
-      currency: z.string().default("EUR").describe("Currency code (default: EUR)"),
-      issuedDate: z
-        .string()
-        .optional()
-        .describe("Quote date in ISO 8601 format"),
-      validUntil: z
-        .string()
-        .optional()
-        .describe("Expiration date in ISO 8601 format"),
-      lines: z
-        .array(
-          z.object({
-            name: z.string().describe("Item description"),
-            quantity: z.number().default(1).describe("Quantity"),
-            unitPrice: z.number().describe("Unit price before tax"),
-            taxKey: z
-              .string()
-              .default("IVA_21")
-              .describe("Tax code (e.g. IVA_21, IVA_10, IVA_4)"),
-          })
-        )
-        .describe("Line items"),
+      currency: z.string().default("EUR").describe("Currency (default: EUR)"),
+      issuedDate: z.string().optional().describe("Quote date YYYY-MM-DD"),
+      validUntil: z.string().optional().describe("Expiration date YYYY-MM-DD"),
+      lines: z.array(lineItemSchema).describe("Line items"),
       contact: z
         .object({
           fiscalName: z.string().describe("Client fiscal name"),
           vatNumber: z.string().optional().describe("Tax ID / NIF / CIF"),
           email: z.string().optional().describe("Client email"),
-          address: z
-            .object({
-              country: z.string().default("ES").describe("ISO country code"),
-              province: z.string().optional().describe("Province"),
-              city: z.string().optional().describe("City"),
-              street: z.string().optional().describe("Street"),
-              postalCode: z.string().optional().describe("Postal code"),
-            })
-            .optional()
-            .describe("Client address"),
+          address: addressSchema,
         })
         .describe("Quote recipient"),
       reference: z.string().optional().describe("Internal reference"),
@@ -535,9 +555,13 @@ server.registerTool(
     },
   },
   async (params) => {
+    const body = {
+      ...params,
+      lines: params.lines.map(computeLine),
+    };
     const result = await billinFetch("/quotes", {
       method: "POST",
-      body: JSON.stringify(params),
+      body: JSON.stringify(body),
     });
     return formatResult(result);
   }
@@ -549,15 +573,15 @@ server.registerTool(
   {
     title: "Create Payment",
     description:
-      "Record a payment for an invoice in Billin. Links a payment amount to an existing invoice to track collection status.",
+      "Record a payment for an invoice to track collection status.",
     inputSchema: {
-      invoiceId: z.string().describe("ID of the invoice being paid"),
+      invoiceId: z.string().describe("Invoice ID (UUID) being paid"),
       amount: z.number().describe("Payment amount"),
-      currency: z.string().default("EUR").describe("Currency code (default: EUR)"),
+      currency: z.string().default("EUR").describe("Currency (default: EUR)"),
       paymentDate: z
         .string()
         .optional()
-        .describe("Payment date in ISO 8601 format (defaults to today)"),
+        .describe("Payment date YYYY-MM-DD (defaults to today)"),
       paymentMethod: z
         .string()
         .optional()
@@ -578,11 +602,10 @@ server.registerTool(
   "list_payments",
   {
     title: "List Payments",
-    description:
-      "List payments recorded in your Billin account. Useful for reconciliation and tracking outstanding balances.",
+    description: "List recorded payments for reconciliation and balance tracking.",
     inputSchema: {
       limit: z.number().optional().describe("Max results (1-100, default 10)"),
-      offset: z.number().optional().describe("Results to skip for pagination"),
+      offset: z.number().optional().describe("Skip N results"),
     },
   },
   async (params) => {
